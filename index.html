@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Password Cracker</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 580px;
+    margin: 60px auto;
+    padding: 0 20px;
+    background: #0f0f10;
+    color: #e8e8e8;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: #888; margin: 0 0 24px; font-size: 13px; }
+  label { display: block; margin: 14px 0 6px; font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+  input, select, button {
+    width: 100%;
+    padding: 10px 12px;
+    background: #1a1a1c;
+    color: #e8e8e8;
+    border: 1px solid #2a2a2e;
+    border-radius: 6px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  input[type=file] { padding: 8px; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  button {
+    background: #3b82f6;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    margin-top: 24px;
+    transition: background 0.15s;
+  }
+  button:hover { background: #2563eb; }
+  button:disabled { background: #2a2a2e; color: #666; cursor: not-allowed; }
+  #pdfInfo {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: #1a1a1c;
+    border: 1px solid #2a2a2e;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #aaa;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  #status {
+    margin-top: 20px;
+    padding: 14px;
+    background: #1a1a1c;
+    border: 1px solid #2a2a2e;
+    border-radius: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    min-height: 92px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+  }
+  .found { color: #10b981; font-weight: 600; font-size: 15px; }
+  .err { color: #ef4444; }
+  .warn { color: #f59e0b; }
+  .progress {
+    height: 4px;
+    background: #2a2a2e;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .progress > div {
+    height: 100%;
+    background: #3b82f6;
+    width: 0;
+    transition: width 0.2s;
+  }
+  footer {
+    margin-top: 40px;
+    color: #555;
+    font-size: 11px;
+    text-align: center;
+  }
+  footer a { color: #777; }
+</style>
+</head>
+<body>
+
+<h1>PDF Password Cracker</h1>
+<p class="sub">Runs entirely in your browser. The PDF never leaves your machine.</p>
+
+<label for="file">PDF file</label>
+<input type="file" id="file" accept="application/pdf">
+<div id="pdfInfo" style="display:none"></div>
+
+<label for="charset">Character set</label>
+<select id="charset">
+  <option value="digits" selected>Digits only (0-9)</option>
+  <option value="lower">Lowercase letters (a-z)</option>
+  <option value="upper">Uppercase letters (A-Z)</option>
+  <option value="alpha">Letters (a-z, A-Z)</option>
+  <option value="alphanum">Letters + digits</option>
+  <option value="custom">Custom...</option>
+</select>
+
+<div id="customWrap" style="display:none">
+  <label for="customChars">Custom characters</label>
+  <input type="text" id="customChars" placeholder="e.g. 0123456789abcdef">
+</div>
+
+<div class="row">
+  <div>
+    <label for="length">Length</label>
+    <input type="number" id="length" value="6" min="1" max="10">
+  </div>
+  <div>
+    <label for="workerCount">Workers</label>
+    <input type="number" id="workerCount" value="8" min="1" max="32">
+  </div>
+</div>
+
+<button id="go" disabled>Start cracking</button>
+<button id="stop" style="display:none; background:#ef4444; margin-top:8px">Stop</button>
+
+<div id="status">Pick a PDF to begin.</div>
+<div class="progress"><div id="bar"></div></div>
+
+<footer>
+  All processing is local. No upload, no tracking. PDF v1.6 (R=3, R=4) supported.
+</footer>
+
+<script>
+const CHARSETS = {
+  digits:   "0123456789",
+  lower:    "abcdefghijklmnopqrstuvwxyz",
+  upper:    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  alpha:    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  alphanum: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+};
+
+const $ = id => document.getElementById(id);
+let pdfInfo = null;
+let workers = [];
+const PAD_BYTES = [0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A];
+
+$("workerCount").value = Math.min(16, Math.max(2, navigator.hardwareConcurrency || 4));
+
+// --- PDF parsing ---------------------------------------------------------
+
+function hexToBytes(hex) {
+  hex = hex.replace(/\s/g, "");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i*2, 2), 16);
+  return out;
+}
+
+function parseLiteralString(s) {
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\') {
+      const next = s[i+1];
+      if (next === 'n') { out.push(10); i++; }
+      else if (next === 'r') { out.push(13); i++; }
+      else if (next === 't') { out.push(9); i++; }
+      else if (next === 'b') { out.push(8); i++; }
+      else if (next === 'f') { out.push(12); i++; }
+      else if (next === '(' || next === ')' || next === '\\') { out.push(next.charCodeAt(0)); i++; }
+      else if (next >= '0' && next <= '7') {
+        let oct = '';
+        for (let k = 0; k < 3 && s[i+1+k] >= '0' && s[i+1+k] <= '7'; k++) oct += s[i+1+k];
+        out.push(parseInt(oct, 8));
+        i += oct.length;
+      } else { i++; }
+    } else {
+      out.push(s.charCodeAt(i));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function extractDictEntry(dict, name) {
+  // Try hex string: /Name <hex>
+  let m = dict.match(new RegExp('/' + name + '\\s*<([0-9a-fA-F\\s]+)>'));
+  if (m) return hexToBytes(m[1]);
+  // Try literal string: /Name (...)
+  let i = dict.indexOf('/' + name);
+  if (i < 0) return null;
+  // skip name and whitespace
+  i += name.length + 1;
+  while (i < dict.length && /\s/.test(dict[i])) i++;
+  if (dict[i] !== '(') return null;
+  i++;
+  let depth = 1;
+  let start = i;
+  while (i < dict.length && depth > 0) {
+    if (dict[i] === '\\') { i += 2; continue; }
+    if (dict[i] === '(') depth++;
+    else if (dict[i] === ')') { depth--; if (depth === 0) break; }
+    i++;
+  }
+  return parseLiteralString(dict.substring(start, i));
+}
+
+function findObjectDict(text, objNum) {
+  const re = new RegExp('\\b' + objNum + '\\s+\\d+\\s+obj\\s*<<', 'g');
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let pos = m.index + m[0].length;
+    let depth = 1;
+    const start = pos;
+    while (depth > 0 && pos < text.length - 1) {
+      if (text[pos] === '<' && text[pos+1] === '<') { depth++; pos += 2; }
+      else if (text[pos] === '>' && text[pos+1] === '>') {
+        depth--;
+        if (depth === 0) return text.substring(start, pos);
+        pos += 2;
+      } else { pos++; }
+    }
+  }
+  return null;
+}
+
+// Map bytes 0..255 to JS chars with codepoints 0..255.
+// We can't use TextDecoder("latin1") here because the WHATWG spec aliases it to
+// windows-1252, which silently mangles bytes 0x80-0x9F (e.g. 0x9A -> U+0161).
+// PDF encryption /O, /U, /ID often contain bytes in that range, so any corruption
+// breaks the crypto. Manual fromCharCode preserves bytes exactly.
+function bytesToLatin1(bytes) {
+  let s = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  }
+  return s;
+}
+
+function parsePdfEncryption(bytes) {
+  if (bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) {
+    throw new Error("Not a PDF file (missing %PDF header)");
+  }
+  const text = bytesToLatin1(bytes);
+
+  // /Encrypt reference may be in trailer dict or xref-stream dict
+  const encRefMatch = text.match(/\/Encrypt\s+(\d+)\s+(\d+)\s+R/);
+  if (!encRefMatch) throw new Error("PDF is not encrypted (no /Encrypt entry).");
+  const encObjNum = +encRefMatch[1];
+
+  // /ID array can be in trailer or xref-stream dict
+  const idMatch = text.match(/\/ID\s*\[\s*<([0-9a-fA-F\s]+)>/);
+  if (!idMatch) throw new Error("Could not find /ID in trailer.");
+  const id = hexToBytes(idMatch[1]);
+
+  const fullDict = findObjectDict(text, encObjNum);
+  if (!fullDict) throw new Error("Could not locate encryption object " + encObjNum + ".");
+
+  // Strip nested << >> sub-dicts (e.g. /CF /StdCF) so we only match top-level entries.
+  // Without this, regex for /Length would grab the inner crypt-filter's /Length 16
+  // instead of the top-level /Length 128.
+  let dict = "";
+  let depth = 0;
+  for (let i = 0; i < fullDict.length; i++) {
+    if (fullDict[i] === '<' && fullDict[i+1] === '<') { depth++; i++; continue; }
+    if (fullDict[i] === '>' && fullDict[i+1] === '>') { depth--; i++; continue; }
+    if (depth === 0) dict += fullDict[i];
+  }
+
+  const V = +(dict.match(/\/V\s+(\d+)/) || [0, 0])[1];
+  const R = +(dict.match(/\/R\s+(\d+)/) || [0, 0])[1];
+  let Length = +(dict.match(/\/Length\s+(\d+)/) || [0, 40])[1];
+  // Some PDFs store Length in bytes (16) rather than bits (128). Normalize to bits.
+  if (Length < 40) Length = Length * 8;
+  const P = +(dict.match(/\/P\s+(-?\d+)/) || [0, 0])[1];
+  const O = extractDictEntry(dict, "O");
+  const U = extractDictEntry(dict, "U");
+  const encryptMetadata = !/\/EncryptMetadata\s+false/i.test(dict);
+
+  if (!O || !U) throw new Error("Could not extract /O or /U from encryption dict.");
+
+  return { V, R, Length, P, O, U, id, encryptMetadata };
+}
+
+// --- MD5 (RFC 1321) ------------------------------------------------------
+
+function md5(bytes) {
+  const origLen = bytes.length;
+  const bitLen = origLen * 8;
+  const padLen = (64 - ((origLen + 9) % 64)) % 64;
+  const total = origLen + 1 + padLen + 8;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[origLen] = 0x80;
+  buf[total - 8] = bitLen & 0xff;
+  buf[total - 7] = (bitLen >>> 8) & 0xff;
+  buf[total - 6] = (bitLen >>> 16) & 0xff;
+  buf[total - 5] = (bitLen >>> 24) & 0xff;
+
+  let a0 = 0x67452301, b0 = 0xefcdab89 | 0, c0 = 0x98badcfe | 0, d0 = 0x10325476;
+  const K = new Int32Array([
+    -680876936, -389564586, 606105819, -1044525330, -176418897, 1200080426, -1473231341, -45705983,
+    1770035416, -1958414417, -42063, -1990404162, 1804603682, -40341101, -1502002290, 1236535329,
+    -165796510, -1069501632, 643717713, -373897302, -701558691, 38016083, -660478335, -405537848,
+    568446438, -1019803690, -187363961, 1163531501, -1444681467, -51403784, 1735328473, -1926607734,
+    -378558, -2022574463, 1839030562, -35309556, -1530992060, 1272893353, -155497632, -1094730640,
+    681279174, -358537222, -722521979, 76029189, -640364487, -421815835, 530742520, -995338651,
+    -198630844, 1126891415, -1416354905, -57434055, 1700485571, -1894986606, -1051523, -2054922799,
+    1873313359, -30611744, -1560198380, 1309151649, -145523070, -1120210379, 718787259, -343485551,
+  ]);
+  const S = new Int32Array([
+    7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+    5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+    4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+    6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21,
+  ]);
+
+  const M = new Int32Array(16);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      M[i] = buf[off + i*4] | (buf[off + i*4 + 1] << 8) | (buf[off + i*4 + 2] << 16) | (buf[off + i*4 + 3] << 24);
+    }
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16)      { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5*i + 1) & 15; }
+      else if (i < 48) { f = b ^ c ^ d;          g = (3*i + 5) & 15; }
+      else             { f = c ^ (b | ~d);       g = (7*i) & 15; }
+      const t = (a + f + K[i] + M[g]) | 0;
+      a = d; d = c; c = b;
+      b = (b + ((t << S[i]) | (t >>> (32 - S[i])))) | 0;
+    }
+    a0 = (a0 + a) | 0;
+    b0 = (b0 + b) | 0;
+    c0 = (c0 + c) | 0;
+    d0 = (d0 + d) | 0;
+  }
+
+  const out = new Uint8Array(16);
+  out[0]  = a0 & 0xff;        out[1]  = (a0 >>> 8) & 0xff;  out[2]  = (a0 >>> 16) & 0xff;  out[3]  = (a0 >>> 24) & 0xff;
+  out[4]  = b0 & 0xff;        out[5]  = (b0 >>> 8) & 0xff;  out[6]  = (b0 >>> 16) & 0xff;  out[7]  = (b0 >>> 24) & 0xff;
+  out[8]  = c0 & 0xff;        out[9]  = (c0 >>> 8) & 0xff;  out[10] = (c0 >>> 16) & 0xff;  out[11] = (c0 >>> 24) & 0xff;
+  out[12] = d0 & 0xff;        out[13] = (d0 >>> 8) & 0xff;  out[14] = (d0 >>> 16) & 0xff;  out[15] = (d0 >>> 24) & 0xff;
+  return out;
+}
+
+// --- RC4 ---------------------------------------------------------------
+
+function rc4(key, data) {
+  const S = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) S[i] = i;
+  let j = 0;
+  const keyLen = key.length;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + key[i % keyLen]) & 0xff;
+    const t = S[i]; S[i] = S[j]; S[j] = t;
+  }
+  const out = new Uint8Array(data.length);
+  let i = 0; j = 0;
+  for (let k = 0; k < data.length; k++) {
+    i = (i + 1) & 0xff;
+    j = (j + S[i]) & 0xff;
+    const t = S[i]; S[i] = S[j]; S[j] = t;
+    out[k] = data[k] ^ S[(S[i] + S[j]) & 0xff];
+  }
+  return out;
+}
+
+// --- PDF user-password verification (R=3 or R=4) ------------------------
+
+function verifyUserPassword(pw, info, PAD) {
+  const { O, P, id, R, Length, U, encryptMetadata } = info;
+  const keyLen = Length >>> 3;
+
+  const pwLen = Math.min(pw.length, 32);
+  const padded = new Uint8Array(32);
+  for (let i = 0; i < pwLen; i++) padded[i] = pw.charCodeAt(i) & 0xff;
+  for (let i = pwLen; i < 32; i++) padded[i] = PAD[i - pwLen];
+
+  const extra = (R >= 4 && !encryptMetadata) ? 4 : 0;
+  const hashIn = new Uint8Array(32 + O.length + 4 + id.length + extra);
+  hashIn.set(padded, 0);
+  hashIn.set(O, 32);
+  hashIn[32 + O.length] = P & 0xff;
+  hashIn[32 + O.length + 1] = (P >>> 8) & 0xff;
+  hashIn[32 + O.length + 2] = (P >>> 16) & 0xff;
+  hashIn[32 + O.length + 3] = (P >>> 24) & 0xff;
+  hashIn.set(id, 32 + O.length + 4);
+  if (extra) {
+    const base = 32 + O.length + 4 + id.length;
+    hashIn[base] = 0xff; hashIn[base+1] = 0xff; hashIn[base+2] = 0xff; hashIn[base+3] = 0xff;
+  }
+
+  let hash = md5(hashIn);
+  if (R >= 3) {
+    for (let i = 0; i < 50; i++) hash = md5(hash.subarray(0, keyLen));
+  }
+  const key = hash.subarray(0, keyLen);
+
+  const padId = new Uint8Array(32 + id.length);
+  padId.set(PAD, 0);
+  padId.set(id, 32);
+  let u = md5(padId);
+
+  const xorKey = new Uint8Array(keyLen);
+  for (let i = 0; i < 20; i++) {
+    for (let k = 0; k < keyLen; k++) xorKey[k] = key[k] ^ i;
+    u = rc4(xorKey, u);
+  }
+
+  for (let i = 0; i < 16; i++) if (u[i] !== U[i]) return false;
+  return true;
+}
+
+// --- Worker code (built from the same functions) ------------------------
+
+const WORKER_CODE = `
+const PAD = new Uint8Array(${JSON.stringify(PAD_BYTES)});
+${md5.toString()}
+${rc4.toString()}
+${verifyUserPassword.toString()}
+
+let abort = false;
+self.onmessage = (e) => {
+  if (e.data.type === 'abort') { abort = true; return; }
+  if (e.data.type !== 'work') return;
+  const { info, charset, length, startIdx, endIdx } = e.data;
+  const n = charset.length;
+  let local = 0;
+  let lastPw = '';
+  for (let i = startIdx; i < endIdx; i++) {
+    if (abort) { self.postMessage({ type: 'done' }); return; }
+    let pw = '', v = i;
+    for (let k = 0; k < length; k++) { pw = charset[v % n] + pw; v = (v / n) | 0; }
+    if (verifyUserPassword(pw, info, PAD)) {
+      self.postMessage({ type: 'found', pw });
+      return;
+    }
+    local++;
+    lastPw = pw;
+    if (local >= 5000) {
+      self.postMessage({ type: 'progress', count: local, current: lastPw });
+      local = 0;
+    }
+  }
+  if (local > 0) self.postMessage({ type: 'progress', count: local, current: lastPw });
+  self.postMessage({ type: 'done' });
+};
+`;
+
+// --- UI -----------------------------------------------------------------
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("pdfInfo").style.display = "none";
+  try {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    pdfInfo = parsePdfEncryption(bytes);
+    $("pdfInfo").style.display = "block";
+    $("pdfInfo").textContent =
+      `V=${pdfInfo.V}, R=${pdfInfo.R}, key=${pdfInfo.Length}-bit, P=${pdfInfo.P}, ` +
+      `O=${pdfInfo.O.length}B, U=${pdfInfo.U.length}B, ID=${pdfInfo.id.length}B`;
+    if (pdfInfo.R !== 3 && pdfInfo.R !== 4) {
+      $("status").innerHTML = `<span class="err">Unsupported encryption R=${pdfInfo.R}. This site supports R=3 and R=4 (PDF 1.4-1.6). For R=5/6 (AES-256), use the Python script.</span>`;
+      $("go").disabled = true;
+      return;
+    }
+    $("status").textContent = `Loaded: ${f.name} (${(f.size/1024).toFixed(1)} KB)\nReady. R=${pdfInfo.R}, ${pdfInfo.Length}-bit key.`;
+    $("go").disabled = false;
+  } catch (err) {
+    $("status").innerHTML = '<span class="err">' + err.message + '</span>';
+    $("go").disabled = true;
+  }
+});
+
+$("charset").addEventListener("change", e => {
+  $("customWrap").style.display = e.target.value === "custom" ? "block" : "none";
+});
+
+function stopAllWorkers() {
+  for (const w of workers) {
+    try { w.postMessage({ type: 'abort' }); w.terminate(); } catch {}
+  }
+  workers = [];
+}
+
+$("stop").addEventListener("click", () => {
+  stopAllWorkers();
+  $("status").textContent += "\nStopped.";
+  $("go").style.display = "block";
+  $("stop").style.display = "none";
+});
+
+$("go").addEventListener("click", () => {
+  if (!pdfInfo) return;
+  let cs;
+  if ($("charset").value === "custom") {
+    cs = $("customChars").value;
+    if (!cs) { $("status").innerHTML = '<span class="err">Enter custom characters.</span>'; return; }
+  } else {
+    cs = CHARSETS[$("charset").value];
+  }
+  const length = +$("length").value;
+  const N = Math.max(1, +$("workerCount").value);
+  const total = Math.pow(cs.length, length);
+
+  $("go").style.display = "none";
+  $("stop").style.display = "block";
+  $("bar").style.width = "0";
+
+  const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+  const workerUrl = URL.createObjectURL(blob);
+
+  const chunkSize = Math.ceil(total / N);
+  const start = performance.now();
+  let totalTried = 0;
+  let doneCount = 0;
+  let lastCurrent = '';
+  let foundPw = null;
+
+  for (let i = 0; i < N; i++) {
+    const w = new Worker(workerUrl);
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') {
+        totalTried += m.count;
+        if (m.current) lastCurrent = m.current;
+      } else if (m.type === 'found') {
+        if (foundPw) return;
+        foundPw = m.pw;
+        const secs = (performance.now() - start) / 1000;
+        $("status").innerHTML =
+          `<span class="found">FOUND: ${foundPw}</span>\n` +
+          `Cracked in ${secs.toFixed(2)}s using ${N} workers ` +
+          `(~${(totalTried/secs).toFixed(0)}/s aggregate)`;
+        $("bar").style.width = "100%";
+        stopAllWorkers();
+        $("go").style.display = "block";
+        $("stop").style.display = "none";
+      } else if (m.type === 'done') {
+        doneCount++;
+        if (doneCount === N && !foundPw) {
+          $("status").textContent = `Exhausted ${total.toLocaleString()} passwords. No match.`;
+          $("go").style.display = "block";
+          $("stop").style.display = "none";
+        }
+      }
+    };
+    w.onerror = (err) => {
+      $("status").innerHTML = '<span class="err">Worker error: ' + err.message + '</span>';
+    };
+    w.postMessage({
+      type: 'work',
+      info: pdfInfo,
+      charset: cs,
+      length: length,
+      startIdx: i * chunkSize,
+      endIdx: Math.min((i + 1) * chunkSize, total),
+    });
+    workers.push(w);
+  }
+
+  const ticker = setInterval(() => {
+    if (foundPw || workers.length === 0) { clearInterval(ticker); return; }
+    const secs = (performance.now() - start) / 1000;
+    const rate = totalTried / secs;
+    const eta = rate > 0 ? (total - totalTried) / rate : Infinity;
+    $("status").textContent =
+      `Last tried: ${lastCurrent || '...'}\n` +
+      `${totalTried.toLocaleString()} / ${total.toLocaleString()}  ` +
+      `(${rate.toFixed(0)}/s, ${N} workers)\n` +
+      `ETA: ${formatTime(eta)}`;
+    $("bar").style.width = (totalTried / total * 100) + "%";
+  }, 250);
+});
+
+function formatTime(s) {
+  if (!isFinite(s)) return "calculating...";
+  if (s < 1) return "<1s";
+  if (s < 60) return s.toFixed(0) + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + Math.floor(s%60) + "s";
+  return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
+}
+</script>
+</body>
+</html>
