@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Password Cracker</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 580px;
+    margin: 60px auto;
+    padding: 0 20px;
+    background: #0f0f10;
+    color: #e8e8e8;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: #888; margin: 0 0 24px; font-size: 13px; }
+  label { display: block; margin: 14px 0 6px; font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+  input, select, button {
+    width: 100%;
+    padding: 10px 12px;
+    background: #1a1a1c;
+    color: #e8e8e8;
+    border: 1px solid #2a2a2e;
+    border-radius: 6px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  input[type=file] { padding: 8px; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  button {
+    background: #3b82f6;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    margin-top: 24px;
+    transition: background 0.15s;
+  }
+  button:hover { background: #2563eb; }
+  button:disabled { background: #2a2a2e; color: #666; cursor: not-allowed; }
+  #status {
+    margin-top: 20px;
+    padding: 14px;
+    background: #1a1a1c;
+    border: 1px solid #2a2a2e;
+    border-radius: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    min-height: 72px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+  }
+  .found { color: #10b981; font-weight: 600; font-size: 15px; }
+  .err { color: #ef4444; }
+  .progress {
+    height: 4px;
+    background: #2a2a2e;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .progress > div {
+    height: 100%;
+    background: #3b82f6;
+    width: 0;
+    transition: width 0.2s;
+  }
+  footer {
+    margin-top: 40px;
+    color: #555;
+    font-size: 11px;
+    text-align: center;
+  }
+  footer a { color: #777; }
+</style>
+</head>
+<body>
+
+<h1>PDF Password Cracker</h1>
+<p class="sub">Runs entirely in your browser. The PDF never leaves your machine.</p>
+
+<label for="file">PDF file</label>
+<input type="file" id="file" accept="application/pdf">
+
+<label for="charset">Character set</label>
+<select id="charset">
+  <option value="digits" selected>Digits only (0-9)</option>
+  <option value="lower">Lowercase letters (a-z)</option>
+  <option value="upper">Uppercase letters (A-Z)</option>
+  <option value="alpha">Letters (a-z, A-Z)</option>
+  <option value="alphanum">Letters + digits</option>
+  <option value="custom">Custom...</option>
+</select>
+
+<div id="customWrap" style="display:none">
+  <label for="customChars">Custom characters</label>
+  <input type="text" id="customChars" placeholder="e.g. 0123456789abcdef">
+</div>
+
+<div class="row">
+  <div>
+    <label for="minlen">Min length</label>
+    <input type="number" id="minlen" value="6" min="1" max="12">
+  </div>
+  <div>
+    <label for="maxlen">Max length</label>
+    <input type="number" id="maxlen" value="6" min="1" max="12">
+  </div>
+</div>
+
+<button id="go" disabled>Start cracking</button>
+<button id="stop" style="display:none; background:#ef4444; margin-top:8px">Stop</button>
+
+<div id="status">Pick a PDF to begin.</div>
+<div class="progress"><div id="bar"></div></div>
+
+<footer>
+  All processing is local. No upload, no tracking.
+  Powered by <a href="https://mozilla.github.io/pdf.js/" target="_blank" rel="noopener">PDF.js</a>.
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+if (!window.pdfjsLib) {
+  document.getElementById("status").innerHTML =
+    '<span class="err">Failed to load PDF.js from CDN. Check your internet connection and refresh.</span>';
+}
+if (window.pdfjsLib) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+}
+const pdfjsLib = window.pdfjsLib;
+
+const CHARSETS = {
+  digits:   "0123456789",
+  lower:    "abcdefghijklmnopqrstuvwxyz",
+  upper:    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  alpha:    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  alphanum: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+};
+
+const $ = id => document.getElementById(id);
+let pdfBytes = null;
+let stopFlag = false;
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  pdfBytes = new Uint8Array(await f.arrayBuffer());
+  $("status").textContent = `Loaded: ${f.name} (${(f.size/1024).toFixed(1)} KB)`;
+  $("go").disabled = false;
+});
+
+$("charset").addEventListener("change", e => {
+  $("customWrap").style.display = e.target.value === "custom" ? "block" : "none";
+});
+
+function* candidates(charset, min, max) {
+  for (let len = min; len <= max; len++) {
+    const idx = new Array(len).fill(0);
+    const n = charset.length;
+    while (true) {
+      let s = "";
+      for (let k = 0; k < len; k++) s += charset[idx[k]];
+      yield s;
+      let pos = len - 1;
+      while (pos >= 0) {
+        idx[pos]++;
+        if (idx[pos] < n) break;
+        idx[pos] = 0;
+        pos--;
+      }
+      if (pos < 0) break;
+    }
+  }
+}
+
+function totalCount(charset, min, max) {
+  let t = 0;
+  for (let len = min; len <= max; len++) t += Math.pow(charset.length, len);
+  return t;
+}
+
+async function tryPassword(pw) {
+  try {
+    const task = pdfjsLib.getDocument({
+      data: pdfBytes.slice(),
+      password: pw,
+      verbosity: 0,
+    });
+    const doc = await task.promise;
+    doc.destroy();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+$("stop").addEventListener("click", () => { stopFlag = true; });
+
+$("go").addEventListener("click", async () => {
+  if (!pdfBytes) return;
+  let cs;
+  if ($("charset").value === "custom") {
+    cs = $("customChars").value;
+    if (!cs) { $("status").innerHTML = '<span class="err">Enter custom characters.</span>'; return; }
+  } else {
+    cs = CHARSETS[$("charset").value];
+  }
+  const min = +$("minlen").value;
+  const max = +$("maxlen").value;
+  if (min < 1 || max < min) { $("status").innerHTML = '<span class="err">Invalid length range.</span>'; return; }
+
+  const total = totalCount(cs, min, max);
+  stopFlag = false;
+  $("go").style.display = "none";
+  $("stop").style.display = "block";
+
+  const start = performance.now();
+  let i = 0;
+
+  for (const pw of candidates(cs, min, max)) {
+    if (stopFlag) {
+      $("status").textContent = `Stopped at ${i.toLocaleString()} / ${total.toLocaleString()}.`;
+      break;
+    }
+    const ok = await tryPassword(pw);
+    i++;
+    if (ok) {
+      const secs = (performance.now() - start) / 1000;
+      $("status").innerHTML =
+        `<span class="found">FOUND: ${pw}</span>\n` +
+        `Tried ${i.toLocaleString()} passwords in ${secs.toFixed(1)}s ` +
+        `(${(i/secs).toFixed(0)}/s)`;
+      $("bar").style.width = "100%";
+      break;
+    }
+    if (i % 50 === 0) {
+      const secs = (performance.now() - start) / 1000;
+      const rate = i / secs;
+      const eta = (total - i) / rate;
+      $("status").textContent =
+        `Trying: ${pw}\n` +
+        `${i.toLocaleString()} / ${total.toLocaleString()}  ` +
+        `(${rate.toFixed(0)}/s)\n` +
+        `ETA: ${formatTime(eta)}`;
+      $("bar").style.width = (i / total * 100) + "%";
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  if (i >= total && !stopFlag) {
+    $("status").textContent = `Exhausted ${total.toLocaleString()} passwords. No match.`;
+  }
+  $("go").style.display = "block";
+  $("stop").style.display = "none";
+});
+
+function formatTime(s) {
+  if (!isFinite(s)) return "unknown";
+  if (s < 60) return s.toFixed(0) + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + Math.floor(s%60) + "s";
+  return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
+}
+</script>
+</body>
+</html>
